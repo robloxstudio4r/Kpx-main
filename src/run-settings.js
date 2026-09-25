@@ -14,7 +14,7 @@ export const loggingEnabled = false; //if logging is enabled
 export const rateLimit = 1000; //this is how many requests can be made by someone per minute in the rate limiter
 
 //turn to false to not require logging in
-export const require_pass = true;
+export const require_pass = false;
 
 //root of everything publicly accessible
 export const publicPath = process.cwd() + "/public";
