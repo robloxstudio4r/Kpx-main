@@ -9,6 +9,7 @@ import tls from 'tls';
 import crypto from 'node:crypto';
 import { dirname, join } from "path";
 import { createRequire } from "module";
+import { fileURLToPath } from 'url';
 
 //Fastify imports
 import Fastify from "fastify";
@@ -38,11 +39,82 @@ const useHTTPS = process.argv.includes('--use-https');
 export const userSessions = new Map(); // { username: sessionId }
 
 const require = createRequire(import.meta.url);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-const scramjetDistPath = join(
-  dirname(require.resolve("@mercuryworkshop/scramjet/package.json")),
-  "dist"
-);
+// ------------------------------------------------------------
+//  FIX: Scramjet 1.1.0+ blocks access to its own package.json
+//  via the "exports" field. Instead of resolving through
+//  package.json, we resolve the main entry point and go up.
+//  We also fall back to a scan of node_modules in case the
+//  main entry can't be resolved either.
+// ------------------------------------------------------------
+function resolveScramjetDist() {
+  var candidates = [];
+
+  // Attempt 1: resolve the "exports" main entry
+  try {
+    var mainEntry = require.resolve("@mercuryworkshop/scramjet");
+    candidates.push(join(dirname(mainEntry), "dist"));
+    candidates.push(join(dirname(mainEntry), "..", "dist"));
+  } catch (e) {
+    // ignore
+  }
+
+  // Attempt 2: walk up from node_modules directly
+  try {
+    var pkgMain = join(__dirname, "..", "node_modules", "@mercuryworkshop", "scramjet", "dist");
+    candidates.push(pkgMain);
+    candidates.push(join(__dirname, "..", "..", "node_modules", "@mercuryworkshop", "scramjet", "dist"));
+  } catch (e) {
+    // ignore
+  }
+
+  // Return the first candidate that actually exists on disk
+  for (var i = 0; i < candidates.length; i++) {
+    try {
+      if (fs.existsSync(candidates[i])) return candidates[i];
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // Last resort: scan every directory for the dist folder
+  try {
+    var base = join(__dirname, "..", "node_modules", "@mercuryworkshop", "scramjet");
+    if (fs.existsSync(base)) {
+      var entries = fs.readdirSync(base);
+      for (var j = 0; j < entries.length; j++) {
+        var sub = join(base, entries[j]);
+        try {
+          if (fs.statSync(sub).isDirectory() && entries[j] === "dist") {
+            return sub;
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+      // Fall back to the base folder itself
+      return base;
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  console.warn('[scramjet] Could not find dist folder — proxy will not serve /scram/ assets.');
+  return null;
+}
+
+const scramjetDistPath = resolveScramjetDist();
+
+if (scramjetDistPath) {
+  console.log('[scramjet] dist path resolved to:', scramjetDistPath);
+  if (typeof logToFile === 'function') {
+    logToFile('info', `[scramjet] dist path: ${scramjetDistPath}`);
+  }
+} else {
+  console.warn('[scramjet] dist path NOT found — /scram/ will 404.');
+}
 
 logging.set_level(logging.NONE);
 Object.assign(wisp.options, {
@@ -53,7 +125,7 @@ Object.assign(wisp.options, {
 
 const cookieKey = await crypto.randomBytes(64);
 
-const startTime = process.hrtime.bigint()
+const startTime = process.hrtime.bigint();
 logToFile('important', `beginning server startup`);
 console.log(`beginning server startup`);
 
@@ -65,10 +137,10 @@ const serverType = useHTTPS
   ? createServer({
     key: fs.readFileSync(TLS_KEY),
     cert: fs.readFileSync(TLS_CERT),
-    minVersion: 'TLSv1.2', // Don't allow TLSv1.1 or older
+    minVersion: 'TLSv1.2',
     ciphers: tls.DEFAULT_CIPHERS,
     honorCipherOrder: true,
-    secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3, // Disable SSLv2/v3
+    secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3,
   })
   : createServer();
 
@@ -140,11 +212,9 @@ fastify.addHook('preHandler', async (request, reply) => {
 });
 logToFile('info', `prehandler registered at ${getUptimeMs()}Ms`);
 
-//register error handler
 fastify.setErrorHandler((error, request, reply) => { errorHandler(error, request, reply) });
 logToFile('info', `error handler registered at ${getUptimeMs()}Ms`);
 
-//register paths
 try {
   fastify.register(async (instance) => {
     await register_paths(instance, userSessions);
@@ -158,17 +228,20 @@ try {
   process.exit(1);
 }
 
-//set up proxy paths
 try {
   fastify.get("/uv/uv.config.js", (req, res) => {
     return res.sendFile("uv/uv.config.js", publicPath);
   });
 
-  fastify.register(fastifyStatic, {
-    root: scramjetDistPath,
-    prefix: "/scram/",
-    decorateReply: false,
-  });
+  if (scramjetDistPath) {
+    fastify.register(fastifyStatic, {
+      root: scramjetDistPath,
+      prefix: "/scram/",
+      decorateReply: false,
+    });
+  } else {
+    console.warn('[scramjet] Skipping /scram/ static mount — dist path missing.');
+  }
 
   fastify.register(fastifyStatic, {
     root: epoxyPath,
@@ -187,11 +260,9 @@ try {
 }
 logToFile('info', `proxy paths registered at ${getUptimeMs()}Ms`);
 
-//start session cleaner
 setInterval(cleanupOldSessions, CLEANUP_INTERVAL);
 logToFile('info', `session cleaner started at ${getUptimeMs()}Ms`);
 
-//start server
 fastify.server.on("listening", () => {
   logToFile('info', `fastify listening at ${getUptimeMs()}Ms`);
 });
@@ -206,8 +277,6 @@ function shutdown() {
   process.exit(0);
 }
 
-//the site MUST have https to work on the browser since it uses the 'crypto' function
-//Ultraviolet also MUST run on 8080, i highly reccomend using a reverse proxy to route from 8080 to 443
 const PORT = process.env.PORT || 8080;
 
 fastify.listen({
@@ -218,12 +287,10 @@ fastify.listen({
 logToFile('important', `Server startup completed in ${getUptimeMs()}Ms, server listening on port ${PORT}`);
 console.log(`Server startup completed in ${getUptimeMs()}Ms, server listening on port ${PORT}`);
 
-//BUILT-IN REVERSE PROXY
-//automatically listens to 443, takes proxy input from 8080
 if (useHTTPS) {
   startReverseProxy({
     target: "http://127.0.0.1:8080",
-    enableHttpRedirect: true,   // will start :80 redirect
+    enableHttpRedirect: true,
     tlsKey: TLS_KEY,
     tlsCert: TLS_CERT,
   });
